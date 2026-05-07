@@ -1,15 +1,19 @@
 from flask import Flask, request, jsonify, render_template_string
+import os
 import requests
 import zipfile
 import io
 import csv
 import time
+import concurrent.futures
+from collections import defaultdict
 from datetime import datetime, timedelta
 import pytz
 
 app = Flask(__name__)
 
 PACIFIC = pytz.timezone("America/Los_Angeles")
+NODE = "ELAP_PACE-APND"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -23,105 +27,133 @@ def dt_to_utc_str(dt_str):
     return utc_dt.strftime("%Y%m%dT%H:%M-0000")
 
 
-def fetch_dam_day(date_str):
-    """Fetch DAM LMP data for a single date. Returns (rows, error_string)."""
+def _fetch(label, params):
+    """Shared fetch logic. Returns (rows, error_string)."""
     base_url = "https://oasis.caiso.com/oasisapi/SingleZip"
-    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-
-    params = {
-        "queryname": "PRC_LMP",
-        "market_run_id": "DAM",
-        "startdatetime": dt_to_utc_str(date_str),
-        "enddatetime": dt_to_utc_str(next_day),
-        "version": 1,
-        "node": "ELAP_PACE_UAMPS_LOAD",
-        "resultformat": 6,
-    }
-
-    print(f"[DAM] Fetching {date_str} | start={params['startdatetime']} end={params['enddatetime']}", flush=True)
+    print(f"[{label}] params={params}", flush=True)
 
     for attempt in range(3):
         try:
             resp = requests.get(base_url, params=params, headers=HEADERS, timeout=90)
-            print(f"[DAM] HTTP {resp.status_code}, size={len(resp.content)}, ct={resp.headers.get('content-type', 'unknown')}", flush=True)
+            print(f"[{label}] HTTP {resp.status_code}, size={len(resp.content)}", flush=True)
 
             if resp.status_code == 429:
                 wait = 10 * (attempt + 1)
-                print(f"[DAM] Rate limited — waiting {wait}s (attempt {attempt + 1})", flush=True)
+                print(f"[{label}] Rate limited — waiting {wait}s", flush=True)
                 time.sleep(wait)
                 continue
 
             if resp.status_code != 200:
                 return [], f"HTTP {resp.status_code} from CAISO"
 
-            # CAISO returns XML on error, ZIP on success
             if resp.content[:1] == b"<":
                 xml_msg = resp.content[:800].decode("utf-8", errors="replace")
-                print(f"[WARN] XML error response: {xml_msg}", flush=True)
-                # Try to extract a readable message from the XML
+                print(f"[{label}] XML error: {xml_msg}", flush=True)
                 import re
-                match = re.search(r"<err>(.*?)</err>|<message>(.*?)</message>|ERR-\d+.*?(?=<)", xml_msg, re.DOTALL)
+                match = re.search(r"<err>(.*?)</err>|<message>(.*?)</message>", xml_msg, re.DOTALL)
                 friendly = match.group(0)[:200] if match else xml_msg[:200]
                 return [], f"CAISO API error: {friendly}"
 
             try:
                 rows = []
                 with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
-                    print(f"[DAM] ZIP contains: {z.namelist()}", flush=True)
+                    print(f"[{label}] ZIP: {z.namelist()}", flush=True)
                     for name in z.namelist():
                         if name.endswith(".csv"):
                             with z.open(name) as f:
                                 reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8"))
                                 file_rows = list(reader)
-                                print(f"[DAM] {name}: {len(file_rows)} rows | cols={reader.fieldnames}", flush=True)
+                                print(f"[{label}] {name}: {len(file_rows)} rows | cols={reader.fieldnames}", flush=True)
                                 rows.extend(file_rows)
+                        elif name.endswith(".xml"):
+                            with z.open(name) as f:
+                                xml_content = f.read(800).decode("utf-8", errors="replace")
+                                print(f"[{label}] XML in ZIP ({name}): {xml_content}", flush=True)
                 return rows, None
             except zipfile.BadZipFile:
                 snippet = resp.content[:300].decode("utf-8", errors="replace")
-                print(f"[ERROR] Response is not a ZIP: {snippet}", flush=True)
-                return [], f"Response was not a valid ZIP file: {snippet[:200]}"
+                print(f"[{label}] Not a ZIP: {snippet}", flush=True)
+                return [], f"Response was not a valid ZIP: {snippet[:200]}"
 
         except Exception as e:
-            print(f"[ERROR] fetch_dam_day attempt {attempt + 1}: {e}", flush=True)
+            print(f"[{label}] attempt {attempt + 1} error: {e}", flush=True)
             if attempt < 2:
                 time.sleep(5)
 
-    return [], "All 3 fetch attempts failed — CAISO may be unavailable"
+    return [], "All 3 fetch attempts failed"
+
+
+def fetch_dam_day(date_str):
+    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    return _fetch("DAM", {
+        "queryname": "PRC_LMP",
+        "market_run_id": "DAM",
+        "startdatetime": dt_to_utc_str(date_str),
+        "enddatetime": dt_to_utc_str(next_day),
+        "version": 1,
+        "node": NODE,
+        "resultformat": 6,
+    })
+
+
+def fetch_rtm_day(date_str):
+    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    return _fetch("RTM", {
+        "queryname": "PRC_INTVL_LMP",
+        "market_run_id": "RTM",
+        "startdatetime": dt_to_utc_str(date_str),
+        "enddatetime": dt_to_utc_str(next_day),
+        "version": 1,
+        "node": NODE,
+        "resultformat": 6,
+    })
 
 
 def parse_dam_rows(rows):
-    """Parse raw CSV rows into hourly LMP dicts."""
     if not rows:
         return []
-
     lmp_types = set(r.get("LMP_TYPE", "MISSING") for r in rows)
-    print(f"[PARSE] {len(rows)} raw rows | LMP_TYPE values present: {lmp_types}", flush=True)
-
+    print(f"[PARSE DAM] {len(rows)} rows | LMP_TYPE values: {lmp_types}", flush=True)
     lmp_rows = [r for r in rows if r.get("LMP_TYPE") == "LMP"]
-    print(f"[PARSE] After LMP_TYPE=LMP filter: {len(lmp_rows)} rows", flush=True)
-
     result = []
     for row in lmp_rows:
         try:
-            interval_start = (
-                row.get("INTERVALSTARTTIME_GMT")
-                or row.get("INTERVAL_START_GMT")
-                or ""
-            )
+            interval_start = row.get("INTERVALSTARTTIME_GMT") or row.get("INTERVAL_START_GMT") or ""
             mw = float(row.get("MW", 0))
             if interval_start:
                 dt_utc = datetime.strptime(interval_start[:19], "%Y-%m-%dT%H:%M:%S")
                 dt_utc = pytz.utc.localize(dt_utc)
                 dt_pt = dt_utc.astimezone(PACIFIC)
-                result.append({
-                    "date": dt_pt.strftime("%Y-%m-%d"),
-                    "hour": dt_pt.hour,
-                    "lmp": round(mw, 4),
-                })
+                result.append({"date": dt_pt.strftime("%Y-%m-%d"), "hour": dt_pt.hour, "lmp": round(mw, 4)})
         except Exception as e:
-            print(f"[PARSE ERROR] {e} | row={row}", flush=True)
-
+            print(f"[PARSE DAM ERROR] {e}", flush=True)
     result.sort(key=lambda x: (x["date"], x["hour"]))
+    return result
+
+
+def parse_rtm_to_hourly(rows):
+    """Average 5-min RTM intervals into hourly LMP."""
+    if not rows:
+        return []
+    lmp_types = set(r.get("LMP_TYPE", "MISSING") for r in rows)
+    print(f"[PARSE RTM] {len(rows)} rows | LMP_TYPE values: {lmp_types}", flush=True)
+    lmp_rows = [r for r in rows if r.get("LMP_TYPE") == "LMP"]
+    buckets = defaultdict(list)
+    for row in lmp_rows:
+        try:
+            interval_start = row.get("INTERVALSTARTTIME_GMT") or row.get("INTERVAL_START_GMT") or ""
+            mw = float(row.get("MW", 0))
+            if interval_start:
+                dt_utc = datetime.strptime(interval_start[:19], "%Y-%m-%dT%H:%M:%S")
+                dt_utc = pytz.utc.localize(dt_utc)
+                dt_pt = dt_utc.astimezone(PACIFIC)
+                buckets[(dt_pt.strftime("%Y-%m-%d"), dt_pt.hour)].append(mw)
+        except Exception as e:
+            print(f"[PARSE RTM ERROR] {e}", flush=True)
+    result = []
+    for (date, hour), vals in sorted(buckets.items()):
+        result.append({"date": date, "hour": hour, "lmp": round(sum(vals) / len(vals), 4)})
+    print(f"[PARSE RTM] {len(result)} hourly averages from {len(lmp_rows)} intervals", flush=True)
     return result
 
 
@@ -130,8 +162,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>CAISO DAM — ELAP_PACE_UAMPS_LOAD</title>
+<title>CAISO DAM + RTM — ELAP_PACE-APND</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet"/>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
     --bg: #fdf8ee;
@@ -165,7 +198,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .header-right .node { font-family: var(--mono); font-size: 11px; color: var(--muted); }
   .header-right .last-updated { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 2px; }
 
-  .main { max-width: 860px; margin: 0 auto; padding: 24px 20px; }
+  .main { max-width: 920px; margin: 0 auto; padding: 24px 20px; }
 
   .control-bar {
     background: var(--surface); border: 1px solid var(--border);
@@ -183,8 +216,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   input[type="date"] {
     font-family: var(--mono); font-size: 13px; color: var(--text);
     border: 1px solid var(--border); background: var(--surface2);
-    padding: 5px 10px; height: 32px; cursor: pointer;
-    outline: none;
+    padding: 5px 10px; height: 32px; cursor: pointer; outline: none;
   }
   input[type="date"]:focus { border-color: var(--accent); }
   .refresh-btn {
@@ -216,10 +248,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .stats-row { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
   .stat-chip {
     background: var(--surface); border: 1px solid var(--border);
-    padding: 8px 16px; font-family: var(--mono);
+    padding: 8px 16px; font-family: var(--mono); flex: 1; min-width: 120px;
   }
   .stat-chip .s-label { font-size: 9px; color: var(--muted); letter-spacing: 2px; text-transform: uppercase; display: block; margin-bottom: 3px; }
   .stat-chip .s-val { font-size: 15px; color: var(--text); font-weight: 500; }
+  .stat-chip.dam-chip { border-top: 3px solid var(--accent); }
+  .stat-chip.rtm-chip { border-top: 3px solid #2a7a8a; }
+  .stat-chip.diff-chip { border-top: 3px solid var(--muted); }
 
   .section-header {
     display: flex; align-items: center; gap: 10px;
@@ -240,7 +275,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   }
   th:first-child { text-align: left; }
   th:last-child { border-right: none; }
-  td { padding: 6px 16px; border-bottom: 1px solid var(--border2); border-right: 1px solid var(--border2); text-align: right; }
+  th.dam-col { color: var(--accent); }
+  th.rtm-col { color: #2a7a8a; }
+  th.diff-col { color: var(--muted); }
+  td { padding: 7px 16px; border-bottom: 1px solid var(--border2); border-right: 1px solid var(--border2); text-align: right; }
   td:first-child { text-align: left; color: var(--muted); font-size: 11px; white-space: nowrap; }
   td:last-child { border-right: none; }
   tr:last-child td { border-bottom: none; }
@@ -249,23 +287,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .vpos { color: var(--danger); }
   .vneg { color: #1a6b3a; }
   .vneu { color: var(--text); }
-
+  .vna  { color: var(--border); }
   .avg-row td { font-weight: 600; background: var(--surface2) !important; border-top: 2px solid var(--border); }
   .avg-row td:first-child { color: var(--accent); }
 
-  .empty-state {
-    padding: 48px; text-align: center; font-family: var(--mono); font-size: 12px; color: var(--muted);
-    background: var(--surface); border: 1px solid var(--border); border-top: none;
+  .chart-wrap {
+    background: var(--surface); border: 1px solid var(--border);
+    padding: 20px 24px 16px; margin-bottom: 16px;
   }
 </style>
 </head>
 <body>
 
 <header>
-  <div class="logo">DAM</div>
-  <h1>CAISO Day-Ahead Market</h1>
+  <div class="logo">LMP</div>
+  <h1>CAISO Day-Ahead &amp; Real-Time</h1>
   <div class="header-right">
-    <div class="node">ELAP_PACE_UAMPS_LOAD</div>
+    <div class="node">ELAP_PACE-APND</div>
     <div class="last-updated" id="lastUpdated"></div>
   </div>
 </header>
@@ -288,12 +326,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <div class="error-box" id="errorBox"></div>
 
+  <div id="chartSection" style="display:none">
+    <div class="chart-wrap">
+      <canvas id="lmpChart"></canvas>
+    </div>
+  </div>
+
   <div id="statsRow" class="stats-row" style="display:none"></div>
 
   <div id="tableSection" style="display:none">
     <div class="section-header">
-      <span class="market-label">DAM</span>
-      <span class="section-desc">Day-Ahead Market &middot; Hourly LMP</span>
+      <span class="market-label">DAM &amp; RTM</span>
+      <span class="section-desc">Day-Ahead Hourly &amp; Real-Time 5-min Avg &middot; LMP ($/MWh)</span>
       <span class="section-count" id="rowCount"></span>
     </div>
     <div class="table-wrap"><div id="damTable"></div></div>
@@ -303,18 +347,98 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <script>
 const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
 function todayPT() {
-  // Approximate today in Pacific time using UTC offset
   const now = new Date();
-  const ptOffset = -7 * 60; // PDT (use -8 for PST Nov-Mar)
+  const ptOffset = -7 * 60;
   const ptMs = now.getTime() + (now.getTimezoneOffset() + ptOffset) * 60000;
-  const pt = new Date(ptMs);
-  return pt.toISOString().slice(0, 10);
+  return new Date(ptMs).toISOString().slice(0, 10);
 }
 
 let currentDate = todayPT();
+let lmpChart = null;
+
+function renderChart(rows) {
+  const labels = rows.map(r => 'HE ' + (r.hour + 1));
+  const damData = rows.map(r => r.dam);
+  const rtmData = rows.map(r => r.rtm);
+
+  document.getElementById('chartSection').style.display = 'block';
+
+  if (lmpChart) {
+    lmpChart.data.labels = labels;
+    lmpChart.data.datasets[0].data = damData;
+    lmpChart.data.datasets[1].data = rtmData;
+    lmpChart.update();
+    return;
+  }
+
+  lmpChart = new Chart(document.getElementById('lmpChart'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'DAM LMP',
+          data: damData,
+          backgroundColor: 'rgba(176, 120, 0, 0.75)',
+          borderColor: 'rgba(176, 120, 0, 1)',
+          borderWidth: 1,
+          borderRadius: 2,
+        },
+        {
+          label: 'RTM Avg LMP',
+          data: rtmData,
+          backgroundColor: 'rgba(42, 122, 138, 0.65)',
+          borderColor: 'rgba(42, 122, 138, 1)',
+          borderWidth: 1,
+          borderRadius: 2,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          position: 'top',
+          align: 'end',
+          labels: { font: { family: "'IBM Plex Mono'", size: 11 }, boxWidth: 12, padding: 16 },
+        },
+        tooltip: {
+          bodyFont: { family: "'IBM Plex Mono'", size: 11 },
+          titleFont: { family: "'IBM Plex Mono'", size: 11 },
+          callbacks: {
+            label: ctx => {
+              const v = ctx.parsed.y;
+              return ' ' + ctx.dataset.label + ': ' + (v !== null ? '$' + v.toFixed(4) : '—');
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(232, 208, 138, 0.4)' },
+          ticks: { font: { family: "'IBM Plex Mono'", size: 10 }, color: '#7a6020' },
+        },
+        y: {
+          grid: { color: 'rgba(232, 208, 138, 0.4)' },
+          ticks: {
+            font: { family: "'IBM Plex Mono'", size: 10 },
+            color: '#7a6020',
+            callback: v => '$' + v.toFixed(2),
+          },
+          title: {
+            display: true,
+            text: '$/MWh',
+            font: { family: "'IBM Plex Sans'", size: 11 },
+            color: '#7a6020',
+          },
+        },
+      },
+    },
+  });
+}
 
 function initDatePicker() {
   document.getElementById('datePicker').value = currentDate;
@@ -332,12 +456,8 @@ function setStatus(msg, state) {
 
 function showError(msg) {
   const box = document.getElementById('errorBox');
-  if (msg) {
-    box.textContent = msg;
-    box.style.display = 'block';
-  } else {
-    box.style.display = 'none';
-  }
+  box.textContent = msg || '';
+  box.style.display = msg ? 'block' : 'none';
 }
 
 function changeDay(delta) {
@@ -353,30 +473,37 @@ async function loadData() {
   btn.disabled = true;
   document.getElementById('tableSection').style.display = 'none';
   document.getElementById('statsRow').style.display = 'none';
+  document.getElementById('chartSection').style.display = 'none';
   showError(null);
-  setStatus('Fetching DAM data for ' + currentDate + '...', 'loading');
+  setStatus('Fetching DAM + RTM data for ' + currentDate + '...', 'loading');
 
   try {
     const resp = await fetch('/data?date=' + currentDate);
     const data = await resp.json();
 
     if (data.error) {
-      setStatus('No data — ' + currentDate, 'err');
+      setStatus('Error — ' + currentDate, 'err');
       showError(data.error);
       btn.disabled = false;
       return;
     }
 
     if (!data.rows || data.rows.length === 0) {
-      setStatus('No data returned for ' + currentDate + ' — DAM may not be published yet.', 'err');
+      setStatus('No DAM data for ' + currentDate + ' — may not be published yet.', 'err');
+      if (data.rtm_error) showError('RTM: ' + data.rtm_error);
       btn.disabled = false;
       return;
     }
 
+    renderChart(data.rows);
     renderStats(data.rows);
     renderTable(data.rows);
     document.getElementById('lastUpdated').textContent = 'fetched ' + new Date().toLocaleTimeString();
-    setStatus('Loaded ' + data.rows.length + ' hourly intervals for ' + currentDate + '.', 'ok');
+
+    const rtmCount = data.rows.filter(r => r.rtm !== null).length;
+    const note = rtmCount < data.rows.length ? ` (RTM available for ${rtmCount} hrs)` : '';
+    setStatus('Loaded ' + data.rows.length + ' hours for ' + currentDate + note + '.', 'ok');
+    if (data.rtm_error) showError('RTM note: ' + data.rtm_error);
   } catch (e) {
     setStatus('Fetch failed: ' + e.message, 'err');
     showError('Network or server error: ' + e.message);
@@ -384,73 +511,93 @@ async function loadData() {
   btn.disabled = false;
 }
 
-function vc(v) { return v > 50 ? 'vpos' : v < 0 ? 'vneg' : 'vneu'; }
-function fmt(v) { return '$' + v.toFixed(4); }
+function vc(v) {
+  if (v === null || v === undefined) return 'vna';
+  return v > 50 ? 'vpos' : v < 0 ? 'vneg' : 'vneu';
+}
+function fmt(v) {
+  if (v === null || v === undefined) return '—';
+  return '$' + v.toFixed(4);
+}
+function fmtDiff(v) {
+  if (v === null || v === undefined) return '—';
+  const sign = v > 0 ? '+' : '';
+  return sign + v.toFixed(4);
+}
 function fmtHour(h) {
   const ampm = h < 12 ? 'AM' : 'PM';
   const h12 = h % 12 === 0 ? 12 : h % 12;
   return String(h12).padStart(2, '0') + ':00 ' + ampm;
 }
 
+function avg(arr) {
+  const valid = arr.filter(v => v !== null && v !== undefined);
+  return valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : null;
+}
+
 function renderStats(rows) {
-  const vals = rows.map(r => r.lmp);
-  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-  const max = Math.max(...vals);
-  const min = Math.min(...vals);
-  const maxHour = rows[vals.indexOf(max)].hour;
-  const minHour = rows[vals.indexOf(min)].hour;
+  const damVals = rows.map(r => r.dam);
+  const rtmVals = rows.map(r => r.rtm).filter(v => v !== null);
+  const damAvg = avg(damVals);
+  const rtmAvg = rtmVals.length ? avg(rtmVals) : null;
+  const diffAvg = (damAvg !== null && rtmAvg !== null) ? damAvg - rtmAvg : null;
 
   const statsRow = document.getElementById('statsRow');
   statsRow.style.display = 'flex';
   statsRow.innerHTML =
-    chip('Daily Avg', '$' + avg.toFixed(4)) +
-    chip('Peak LMP', '$' + max.toFixed(4) + ' <small style="font-size:10px;color:var(--muted)">hr ' + (maxHour + 1) + '</small>') +
-    chip('Off-Peak LMP', '$' + min.toFixed(4) + ' <small style="font-size:10px;color:var(--muted)">hr ' + (minHour + 1) + '</small>') +
-    chip('Hours', rows.length);
+    chip('DAM Daily Avg', fmt(damAvg), 'dam-chip') +
+    chip('RTM Daily Avg', rtmAvg !== null ? fmt(rtmAvg) : '—', 'rtm-chip') +
+    chip('Avg Spread (DAM−RTM)', diffAvg !== null ? fmtDiff(diffAvg) : '—', 'diff-chip') +
+    chip('Hours w/ RTM', rtmVals.length + ' / ' + rows.length, '');
 }
 
-function chip(label, val) {
-  return '<div class="stat-chip"><span class="s-label">' + label + '</span><span class="s-val">' + val + '</span></div>';
+function chip(label, val, cls) {
+  return '<div class="stat-chip ' + cls + '"><span class="s-label">' + label + '</span><span class="s-val">' + val + '</span></div>';
 }
 
 function renderTable(rows) {
   document.getElementById('tableSection').style.display = 'block';
   document.getElementById('rowCount').textContent = rows.length + ' hours';
 
-  const vals = rows.map(r => r.lmp);
-  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
-
-  const dt = new Date(rows[0].date + 'T12:00:00');
-  const weekday = DAYS[dt.getDay()];
+  const damVals = rows.map(r => r.dam);
+  const rtmVals = rows.map(r => r.rtm).filter(v => v !== null);
+  const damAvg = avg(damVals);
+  const rtmAvg = rtmVals.length ? avg(rtmVals) : null;
+  const diffAvg = (damAvg !== null && rtmAvg !== null) ? damAvg - rtmAvg : null;
 
   let tbody = '';
   rows.forEach(r => {
+    const diff = (r.dam !== null && r.rtm !== null) ? r.dam - r.rtm : null;
     const endHour = (r.hour + 1) % 24;
     const endAmPm = endHour < 12 ? 'AM' : 'PM';
     const endH12 = endHour % 12 === 0 ? 12 : endHour % 12;
     const timeLabel = fmtHour(r.hour) + ' – ' + String(endH12).padStart(2, '0') + ':00 ' + endAmPm;
     tbody += '<tr>'
       + '<td>' + timeLabel + '</td>'
-      + '<td style="text-align:right">HE ' + (r.hour + 1) + '</td>'
-      + '<td class="' + vc(r.lmp) + '" style="font-weight:500">' + fmt(r.lmp) + '</td>'
+      + '<td>HE ' + (r.hour + 1) + '</td>'
+      + '<td class="' + vc(r.dam) + '">' + fmt(r.dam) + '</td>'
+      + '<td class="' + vc(r.rtm) + '">' + fmt(r.rtm) + '</td>'
+      + '<td class="' + vc(diff) + '">' + fmtDiff(diff) + '</td>'
       + '</tr>';
   });
 
-  // Average row
   tbody += '<tr class="avg-row">'
     + '<td colspan="2">Daily Average</td>'
-    + '<td class="' + vc(avg) + '">' + fmt(avg) + '</td>'
+    + '<td class="' + vc(damAvg) + '">' + fmt(damAvg) + '</td>'
+    + '<td class="' + vc(rtmAvg) + '">' + (rtmAvg !== null ? fmt(rtmAvg) : '—') + '</td>'
+    + '<td class="' + vc(diffAvg) + '">' + (diffAvg !== null ? fmtDiff(diffAvg) : '—') + '</td>'
     + '</tr>';
 
   document.getElementById('damTable').innerHTML =
-    '<table><thead><tr>' +
-    '<th style="text-align:left">Hour (PT)</th>' +
-    '<th>HE</th>' +
-    '<th>LMP ($/MWh)</th>' +
-    '</tr></thead><tbody>' + tbody + '</tbody></table>';
+    '<table><thead><tr>'
+    + '<th style="text-align:left">Hour (PT)</th>'
+    + '<th>HE</th>'
+    + '<th class="dam-col">DAM LMP</th>'
+    + '<th class="rtm-col">RTM Avg LMP</th>'
+    + '<th class="diff-col">Spread (DAM−RTM)</th>'
+    + '</tr></thead><tbody>' + tbody + '</tbody></table>';
 }
 
-// Init
 initDatePicker();
 loadData();
 </script>
@@ -473,22 +620,36 @@ def data():
     except ValueError:
         return jsonify({"error": "Invalid date format, use YYYY-MM-DD"})
 
-    print(f"[DAM] Fetching {date_str}", flush=True)
-    raw, err = fetch_dam_day(date_str)
+    print(f"[REQUEST] Fetching DAM + RTM for {date_str}", flush=True)
 
-    if err:
-        return jsonify({"error": err, "rows": []})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        dam_future = executor.submit(fetch_dam_day, date_str)
+        rtm_future = executor.submit(fetch_rtm_day, date_str)
+        dam_raw, dam_err = dam_future.result()
+        rtm_raw, rtm_err = rtm_future.result()
 
-    rows = parse_dam_rows(raw)
+    if dam_err:
+        return jsonify({"error": dam_err, "rows": []})
 
-    if not rows and raw:
-        return jsonify({
-            "error": f"Retrieved {len(raw)} rows from CAISO but none matched LMP_TYPE=LMP. Check server logs for column names.",
-            "rows": []
+    dam_rows = parse_dam_rows(dam_raw)
+    rtm_rows = parse_rtm_to_hourly(rtm_raw)
+
+    if not dam_rows:
+        return jsonify({"error": "No DAM data returned", "rows": [], "rtm_error": rtm_err})
+
+    rtm_by_hour = {r["hour"]: r["lmp"] for r in rtm_rows}
+    combined = []
+    for r in dam_rows:
+        combined.append({
+            "date": r["date"],
+            "hour": r["hour"],
+            "dam": r["lmp"],
+            "rtm": rtm_by_hour.get(r["hour"], None),
         })
 
-    return jsonify({"rows": rows})
+    return jsonify({"rows": combined, "rtm_error": rtm_err})
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5003)
+    port = int(os.environ.get("PORT", 5003))
+    app.run(debug=False, host="0.0.0.0", port=port)
