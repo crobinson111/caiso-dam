@@ -1,1 +1,1 @@
-web: gunicorn app:app
+web: gunicorn caiso_dam:app
