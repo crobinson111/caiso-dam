@@ -5,6 +5,7 @@ import zipfile
 import io
 import csv
 import time
+import threading
 import concurrent.futures
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -14,23 +15,35 @@ app = Flask(__name__)
 
 PACIFIC = pytz.timezone("America/Los_Angeles")
 NODE = "ELAP_PACE-APND"
+MAX_RANGE_DAYS = 92
+CHUNK_DAYS_DAM = 31
+CHUNK_DAYS_RTM = 14
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/zip, application/octet-stream, */*",
 }
 
+# Global rate limiter — max 1 CAISO request per 3 seconds across all threads
+_caiso_lock = threading.Lock()
+_last_caiso_call = [0.0]
+
 
 def dt_to_utc_str(dt_str):
     local_dt = PACIFIC.localize(datetime.strptime(dt_str, "%Y-%m-%d"))
-    utc_dt = local_dt.astimezone(pytz.utc)
-    return utc_dt.strftime("%Y%m%dT%H:%M-0000")
+    return local_dt.astimezone(pytz.utc).strftime("%Y%m%dT%H:%M-0000")
 
 
 def _fetch(label, params):
-    """Shared fetch logic. Returns (rows, error_string)."""
+    """Rate-limited fetch from CAISO OASIS. Returns (rows, error_string)."""
+    with _caiso_lock:
+        wait = 3.0 - (time.time() - _last_caiso_call[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_caiso_call[0] = time.time()
+
     base_url = "https://oasis.caiso.com/oasisapi/SingleZip"
-    print(f"[{label}] params={params}", flush=True)
+    print(f"[{label}] {params.get('startdatetime')} → {params.get('enddatetime')}", flush=True)
 
     for attempt in range(3):
         try:
@@ -38,14 +51,10 @@ def _fetch(label, params):
             print(f"[{label}] HTTP {resp.status_code}, size={len(resp.content)}", flush=True)
 
             if resp.status_code == 429:
-                wait = 10 * (attempt + 1)
-                print(f"[{label}] Rate limited — waiting {wait}s", flush=True)
-                time.sleep(wait)
+                time.sleep(15 * (attempt + 1))
                 continue
-
             if resp.status_code != 200:
                 return [], f"HTTP {resp.status_code} from CAISO"
-
             if resp.content[:1] == b"<":
                 xml_msg = resp.content[:800].decode("utf-8", errors="replace")
                 print(f"[{label}] XML error: {xml_msg}", flush=True)
@@ -63,17 +72,15 @@ def _fetch(label, params):
                             with z.open(name) as f:
                                 reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8"))
                                 file_rows = list(reader)
-                                print(f"[{label}] {name}: {len(file_rows)} rows | cols={reader.fieldnames}", flush=True)
+                                print(f"[{label}] {name}: {len(file_rows)} rows", flush=True)
                                 rows.extend(file_rows)
                         elif name.endswith(".xml"):
                             with z.open(name) as f:
-                                xml_content = f.read(800).decode("utf-8", errors="replace")
-                                print(f"[{label}] XML in ZIP ({name}): {xml_content}", flush=True)
+                                print(f"[{label}] XML in ZIP: {f.read(400).decode('utf-8', errors='replace')}", flush=True)
                 return rows, None
             except zipfile.BadZipFile:
                 snippet = resp.content[:300].decode("utf-8", errors="replace")
-                print(f"[{label}] Not a ZIP: {snippet}", flush=True)
-                return [], f"Response was not a valid ZIP: {snippet[:200]}"
+                return [], f"Not a valid ZIP: {snippet[:200]}"
 
         except Exception as e:
             print(f"[{label}] attempt {attempt + 1} error: {e}", flush=True)
@@ -83,46 +90,58 @@ def _fetch(label, params):
     return [], "All 3 fetch attempts failed"
 
 
-def fetch_dam_day(date_str):
-    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-    return _fetch("DAM", {
-        "queryname": "PRC_LMP",
-        "market_run_id": "DAM",
-        "startdatetime": dt_to_utc_str(date_str),
-        "enddatetime": dt_to_utc_str(next_day),
-        "version": 1,
-        "node": NODE,
-        "resultformat": 6,
-    })
+def date_chunks(start_date, end_date, chunk_days):
+    chunks = []
+    current = datetime.strptime(start_date, "%Y-%m-%d")
+    end_excl = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+    while current < end_excl:
+        chunk_end = min(current + timedelta(days=chunk_days), end_excl)
+        chunks.append((current.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        current = chunk_end
+    return chunks
 
 
-def fetch_rtm_day(date_str):
-    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-    return _fetch("RTM", {
-        "queryname": "PRC_INTVL_LMP",
-        "market_run_id": "RTM",
-        "startdatetime": dt_to_utc_str(date_str),
-        "enddatetime": dt_to_utc_str(next_day),
-        "version": 1,
-        "node": NODE,
-        "resultformat": 6,
-    })
+def fetch_dam_range(start_date, end_date):
+    all_rows = []
+    for cs, ce in date_chunks(start_date, end_date, CHUNK_DAYS_DAM):
+        rows, err = _fetch("DAM", {
+            "queryname": "PRC_LMP", "market_run_id": "DAM",
+            "startdatetime": dt_to_utc_str(cs), "enddatetime": dt_to_utc_str(ce),
+            "version": 1, "node": NODE, "resultformat": 6,
+        })
+        if err:
+            return [], err
+        all_rows.extend(rows)
+    return all_rows, None
+
+
+def fetch_rtm_range(start_date, end_date):
+    all_rows, last_err = [], None
+    for cs, ce in date_chunks(start_date, end_date, CHUNK_DAYS_RTM):
+        rows, err = _fetch("RTM", {
+            "queryname": "PRC_INTVL_LMP", "market_run_id": "RTM",
+            "startdatetime": dt_to_utc_str(cs), "enddatetime": dt_to_utc_str(ce),
+            "version": 1, "node": NODE, "resultformat": 6,
+        })
+        if err:
+            last_err = err
+            break
+        all_rows.extend(rows)
+    return all_rows, last_err
 
 
 def parse_dam_rows(rows):
     if not rows:
         return []
-    lmp_types = set(r.get("LMP_TYPE", "MISSING") for r in rows)
-    print(f"[PARSE DAM] {len(rows)} rows | LMP_TYPE values: {lmp_types}", flush=True)
     lmp_rows = [r for r in rows if r.get("LMP_TYPE") == "LMP"]
+    print(f"[PARSE DAM] {len(rows)} raw → {len(lmp_rows)} LMP rows", flush=True)
     result = []
     for row in lmp_rows:
         try:
             interval_start = row.get("INTERVALSTARTTIME_GMT") or row.get("INTERVAL_START_GMT") or ""
             mw = float(row.get("MW", 0))
             if interval_start:
-                dt_utc = datetime.strptime(interval_start[:19], "%Y-%m-%dT%H:%M:%S")
-                dt_utc = pytz.utc.localize(dt_utc)
+                dt_utc = pytz.utc.localize(datetime.strptime(interval_start[:19], "%Y-%m-%dT%H:%M:%S"))
                 dt_pt = dt_utc.astimezone(PACIFIC)
                 result.append({"date": dt_pt.strftime("%Y-%m-%d"), "hour": dt_pt.hour, "lmp": round(mw, 4)})
         except Exception as e:
@@ -132,28 +151,23 @@ def parse_dam_rows(rows):
 
 
 def parse_rtm_to_hourly(rows):
-    """Average 5-min RTM intervals into hourly LMP."""
     if not rows:
         return []
-    lmp_types = set(r.get("LMP_TYPE", "MISSING") for r in rows)
-    print(f"[PARSE RTM] {len(rows)} rows | LMP_TYPE values: {lmp_types}", flush=True)
     lmp_rows = [r for r in rows if r.get("LMP_TYPE") == "LMP"]
+    print(f"[PARSE RTM] {len(rows)} raw → {len(lmp_rows)} LMP rows", flush=True)
     buckets = defaultdict(list)
     for row in lmp_rows:
         try:
             interval_start = row.get("INTERVALSTARTTIME_GMT") or row.get("INTERVAL_START_GMT") or ""
             mw = float(row.get("MW", 0))
             if interval_start:
-                dt_utc = datetime.strptime(interval_start[:19], "%Y-%m-%dT%H:%M:%S")
-                dt_utc = pytz.utc.localize(dt_utc)
+                dt_utc = pytz.utc.localize(datetime.strptime(interval_start[:19], "%Y-%m-%dT%H:%M:%S"))
                 dt_pt = dt_utc.astimezone(PACIFIC)
                 buckets[(dt_pt.strftime("%Y-%m-%d"), dt_pt.hour)].append(mw)
         except Exception as e:
             print(f"[PARSE RTM ERROR] {e}", flush=True)
-    result = []
-    for (date, hour), vals in sorted(buckets.items()):
-        result.append({"date": date, "hour": hour, "lmp": round(sum(vals) / len(vals), 4)})
-    print(f"[PARSE RTM] {len(result)} hourly averages from {len(lmp_rows)} intervals", flush=True)
+    result = [{"date": d, "hour": h, "lmp": round(sum(v) / len(v), 4)} for (d, h), v in sorted(buckets.items())]
+    print(f"[PARSE RTM] {len(result)} hourly averages", flush=True)
     return result
 
 
@@ -167,19 +181,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   :root {
-    --bg: #fdf8ee;
-    --surface: #ffffff;
-    --surface2: #fef3d0;
-    --border: #e8d08a;
-    --border2: #f0dfa0;
-    --text: #2a1f00;
-    --muted: #7a6020;
-    --accent: #b07800;
-    --accent-dark: #8a5c00;
-    --danger: #c0392b;
-    --neg: #1a6b3a;
-    --mono: 'IBM Plex Mono', monospace;
-    --sans: 'IBM Plex Sans', sans-serif;
+    --bg: #fdf8ee; --surface: #ffffff; --surface2: #fef3d0;
+    --border: #e8d08a; --border2: #f0dfa0;
+    --text: #2a1f00; --muted: #7a6020;
+    --accent: #b07800; --accent-dark: #8a5c00;
+    --rtm: #2a7a8a; --danger: #c0392b;
+    --mono: 'IBM Plex Mono', monospace; --sans: 'IBM Plex Sans', sans-serif;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: var(--sans); min-height: 100vh; }
@@ -193,40 +200,36 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     display: grid; place-items: center;
     font-family: var(--mono); font-size: 11px; color: #fff; font-weight: 500;
   }
-  header h1 { font-size: 18px; font-weight: 600; letter-spacing: 1px; color: var(--text); }
+  header h1 { font-size: 18px; font-weight: 600; letter-spacing: 1px; }
   .header-right { margin-left: auto; text-align: right; }
   .header-right .node { font-family: var(--mono); font-size: 11px; color: var(--muted); }
   .header-right .last-updated { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 2px; }
 
-  .main { max-width: 920px; margin: 0 auto; padding: 24px 20px; }
+  .main { max-width: 960px; margin: 0 auto; padding: 24px 20px; }
 
   .control-bar {
     background: var(--surface); border: 1px solid var(--border);
     padding: 16px 20px; margin-bottom: 20px;
-    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
   }
-  .date-nav { display: flex; align-items: center; gap: 8px; }
-  .nav-btn {
-    background: transparent; border: 1px solid var(--border);
-    color: var(--accent); font-family: var(--mono); font-size: 16px;
-    width: 32px; height: 32px; cursor: pointer; display: grid; place-items: center;
-    transition: background 0.15s;
-  }
-  .nav-btn:hover { background: var(--surface2); }
+  .date-group { display: flex; align-items: center; gap: 8px; }
+  .date-label { font-family: var(--mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
   input[type="date"] {
     font-family: var(--mono); font-size: 13px; color: var(--text);
     border: 1px solid var(--border); background: var(--surface2);
     padding: 5px 10px; height: 32px; cursor: pointer; outline: none;
   }
   input[type="date"]:focus { border-color: var(--accent); }
-  .refresh-btn {
+  .date-sep { font-family: var(--mono); color: var(--muted); font-size: 13px; padding: 0 4px; }
+  .range-hint { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-left: 4px; }
+  .load-btn {
     background: var(--accent); border: none; color: #fff;
     font-family: var(--sans); font-size: 13px; font-weight: 600;
-    padding: 7px 20px; height: 32px; cursor: pointer; margin-left: auto;
+    padding: 7px 22px; height: 32px; cursor: pointer; margin-left: auto;
     transition: background 0.15s;
   }
-  .refresh-btn:hover { background: var(--accent-dark); }
-  .refresh-btn:disabled { background: var(--border); cursor: not-allowed; }
+  .load-btn:hover { background: var(--accent-dark); }
+  .load-btn:disabled { background: var(--border); cursor: not-allowed; }
 
   .status-bar {
     font-family: var(--mono); font-size: 11px; color: var(--muted);
@@ -245,15 +248,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     word-break: break-word; display: none;
   }
 
+  .chart-wrap {
+    background: var(--surface); border: 1px solid var(--border);
+    padding: 20px 24px 16px; margin-bottom: 16px;
+  }
+
   .stats-row { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
   .stat-chip {
     background: var(--surface); border: 1px solid var(--border);
-    padding: 8px 16px; font-family: var(--mono); flex: 1; min-width: 120px;
+    padding: 8px 16px; font-family: var(--mono); flex: 1; min-width: 130px;
   }
   .stat-chip .s-label { font-size: 9px; color: var(--muted); letter-spacing: 2px; text-transform: uppercase; display: block; margin-bottom: 3px; }
   .stat-chip .s-val { font-size: 15px; color: var(--text); font-weight: 500; }
   .stat-chip.dam-chip { border-top: 3px solid var(--accent); }
-  .stat-chip.rtm-chip { border-top: 3px solid #2a7a8a; }
+  .stat-chip.rtm-chip { border-top: 3px solid var(--rtm); }
   .stat-chip.diff-chip { border-top: 3px solid var(--muted); }
 
   .section-header {
@@ -264,9 +272,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .section-desc { font-size: 12px; color: var(--muted); }
   .section-count { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-left: auto; }
 
-  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-top: none; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-top: none; max-height: 520px; overflow-y: auto; }
   table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
-  thead tr { background: var(--surface2); }
+  thead tr { background: var(--surface2); position: sticky; top: 0; z-index: 1; }
   th {
     padding: 8px 16px; text-align: right;
     color: var(--muted); font-weight: 500; font-size: 11px;
@@ -276,8 +284,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   th:first-child { text-align: left; }
   th:last-child { border-right: none; }
   th.dam-col { color: var(--accent); }
-  th.rtm-col { color: #2a7a8a; }
-  th.diff-col { color: var(--muted); }
+  th.rtm-col { color: var(--rtm); }
   td { padding: 7px 16px; border-bottom: 1px solid var(--border2); border-right: 1px solid var(--border2); text-align: right; }
   td:first-child { text-align: left; color: var(--muted); font-size: 11px; white-space: nowrap; }
   td:last-child { border-right: none; }
@@ -290,11 +297,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .vna  { color: var(--border); }
   .avg-row td { font-weight: 600; background: var(--surface2) !important; border-top: 2px solid var(--border); }
   .avg-row td:first-child { color: var(--accent); }
-
-  .chart-wrap {
-    background: var(--surface); border: 1px solid var(--border);
-    padding: 20px 24px 16px; margin-bottom: 16px;
-  }
 </style>
 </head>
 <body>
@@ -311,17 +313,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="main">
 
   <div class="control-bar">
-    <div class="date-nav">
-      <button class="nav-btn" onclick="changeDay(-1)" title="Previous day">&#8249;</button>
-      <input type="date" id="datePicker" onchange="onDateChange()" />
-      <button class="nav-btn" onclick="changeDay(1)" title="Next day">&#8250;</button>
+    <div class="date-group">
+      <span class="date-label">From</span>
+      <input type="date" id="startDate" onchange="onDateChange()" />
+      <span class="date-sep">—</span>
+      <span class="date-label">To</span>
+      <input type="date" id="endDate" onchange="onDateChange()" />
+      <span class="range-hint" id="rangeHint"></span>
     </div>
-    <button class="refresh-btn" id="refreshBtn" onclick="loadData()">&#8635; Refresh</button>
+    <button class="load-btn" id="loadBtn" onclick="loadData()">&#8635; Load</button>
   </div>
 
   <div class="status-bar">
     <div class="status-dot" id="statusDot"></div>
-    <span id="statusMsg">Loading...</span>
+    <span id="statusMsg">Select a date range and click Load.</span>
   </div>
 
   <div class="error-box" id="errorBox"></div>
@@ -337,172 +342,100 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div id="tableSection" style="display:none">
     <div class="section-header">
       <span class="market-label">DAM &amp; RTM</span>
-      <span class="section-desc">Day-Ahead Hourly &amp; Real-Time 5-min Avg &middot; LMP ($/MWh)</span>
+      <span class="section-desc" id="tableDesc"></span>
       <span class="section-count" id="rowCount"></span>
     </div>
-    <div class="table-wrap"><div id="damTable"></div></div>
+    <div class="table-wrap"><div id="dataTable"></div></div>
   </div>
 
 </div>
 
 <script>
-const DAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
 function todayPT() {
   const now = new Date();
-  const ptOffset = -7 * 60;
-  const ptMs = now.getTime() + (now.getTimezoneOffset() + ptOffset) * 60000;
+  const ptMs = now.getTime() + (now.getTimezoneOffset() + (-7 * 60)) * 60000;
   return new Date(ptMs).toISOString().slice(0, 10);
 }
 
-let currentDate = todayPT();
-let lmpChart = null;
-
-function renderChart(rows) {
-  const labels = rows.map(r => 'HE ' + (r.hour + 1));
-  const damData = rows.map(r => r.dam);
-  const rtmData = rows.map(r => r.rtm);
-
-  document.getElementById('chartSection').style.display = 'block';
-
-  if (lmpChart) {
-    lmpChart.data.labels = labels;
-    lmpChart.data.datasets[0].data = damData;
-    lmpChart.data.datasets[1].data = rtmData;
-    lmpChart.update();
-    return;
-  }
-
-  lmpChart = new Chart(document.getElementById('lmpChart'), {
-    type: 'bar',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'DAM LMP',
-          data: damData,
-          backgroundColor: 'rgba(176, 120, 0, 0.75)',
-          borderColor: 'rgba(176, 120, 0, 1)',
-          borderWidth: 1,
-          borderRadius: 2,
-        },
-        {
-          label: 'RTM Avg LMP',
-          data: rtmData,
-          backgroundColor: 'rgba(42, 122, 138, 0.65)',
-          borderColor: 'rgba(42, 122, 138, 1)',
-          borderWidth: 1,
-          borderRadius: 2,
-        },
-      ],
-    },
-    options: {
-      responsive: true,
-      interaction: { mode: 'index', intersect: false },
-      plugins: {
-        legend: {
-          position: 'top',
-          align: 'end',
-          labels: { font: { family: "'IBM Plex Mono'", size: 11 }, boxWidth: 12, padding: 16 },
-        },
-        tooltip: {
-          bodyFont: { family: "'IBM Plex Mono'", size: 11 },
-          titleFont: { family: "'IBM Plex Mono'", size: 11 },
-          callbacks: {
-            label: ctx => {
-              const v = ctx.parsed.y;
-              return ' ' + ctx.dataset.label + ': ' + (v !== null ? '$' + v.toFixed(4) : '—');
-            },
-          },
-        },
-      },
-      scales: {
-        x: {
-          grid: { color: 'rgba(232, 208, 138, 0.4)' },
-          ticks: { font: { family: "'IBM Plex Mono'", size: 10 }, color: '#7a6020' },
-        },
-        y: {
-          grid: { color: 'rgba(232, 208, 138, 0.4)' },
-          ticks: {
-            font: { family: "'IBM Plex Mono'", size: 10 },
-            color: '#7a6020',
-            callback: v => '$' + v.toFixed(2),
-          },
-          title: {
-            display: true,
-            text: '$/MWh',
-            font: { family: "'IBM Plex Sans'", size: 11 },
-            color: '#7a6020',
-          },
-        },
-      },
-    },
-  });
-}
-
-function initDatePicker() {
-  document.getElementById('datePicker').value = currentDate;
+function init() {
+  const today = todayPT();
+  document.getElementById('startDate').value = today;
+  document.getElementById('endDate').value = today;
+  updateRangeHint();
 }
 
 function onDateChange() {
-  currentDate = document.getElementById('datePicker').value;
-  loadData();
+  updateRangeHint();
+}
+
+function updateRangeHint() {
+  const s = document.getElementById('startDate').value;
+  const e = document.getElementById('endDate').value;
+  const hint = document.getElementById('rangeHint');
+  if (!s || !e) { hint.textContent = ''; return; }
+  const days = Math.round((new Date(e + 'T12:00:00') - new Date(s + 'T12:00:00')) / 86400000) + 1;
+  if (days < 1) { hint.textContent = '⚠ end before start'; hint.style.color = 'var(--danger)'; return; }
+  if (days > 92) { hint.textContent = '⚠ max 92 days'; hint.style.color = 'var(--danger)'; return; }
+  hint.textContent = days === 1 ? '1 day' : days + ' days';
+  hint.style.color = 'var(--muted)';
 }
 
 function setStatus(msg, state) {
   document.getElementById('statusMsg').textContent = msg;
   document.getElementById('statusDot').className = 'status-dot' + (state ? ' ' + state : '');
 }
-
 function showError(msg) {
   const box = document.getElementById('errorBox');
   box.textContent = msg || '';
   box.style.display = msg ? 'block' : 'none';
 }
 
-function changeDay(delta) {
-  const d = new Date(currentDate + 'T12:00:00');
-  d.setDate(d.getDate() + delta);
-  currentDate = d.toISOString().slice(0, 10);
-  document.getElementById('datePicker').value = currentDate;
-  loadData();
-}
-
 async function loadData() {
-  const btn = document.getElementById('refreshBtn');
+  const start = document.getElementById('startDate').value;
+  const end = document.getElementById('endDate').value;
+  if (!start || !end) { setStatus('Please select a date range.', 'err'); return; }
+
+  const days = Math.round((new Date(end + 'T12:00:00') - new Date(start + 'T12:00:00')) / 86400000) + 1;
+  if (days < 1) { setStatus('End date must be on or after start date.', 'err'); return; }
+  if (days > 92) { setStatus('Maximum range is 92 days (~3 months).', 'err'); return; }
+
+  const btn = document.getElementById('loadBtn');
   btn.disabled = true;
-  document.getElementById('tableSection').style.display = 'none';
-  document.getElementById('statsRow').style.display = 'none';
   document.getElementById('chartSection').style.display = 'none';
+  document.getElementById('statsRow').style.display = 'none';
+  document.getElementById('tableSection').style.display = 'none';
   showError(null);
-  setStatus('Fetching DAM + RTM data for ' + currentDate + '...', 'loading');
+
+  const waitMsg = days > 7 ? ` — fetching ${days} days, please wait…` : '';
+  setStatus('Loading data for ' + start + (days > 1 ? ' → ' + end : '') + waitMsg, 'loading');
 
   try {
-    const resp = await fetch('/data?date=' + currentDate);
+    const resp = await fetch('/data?start_date=' + start + '&end_date=' + end);
     const data = await resp.json();
 
     if (data.error) {
-      setStatus('Error — ' + currentDate, 'err');
+      setStatus('Error', 'err');
       showError(data.error);
       btn.disabled = false;
       return;
     }
-
     if (!data.rows || data.rows.length === 0) {
-      setStatus('No DAM data for ' + currentDate + ' — may not be published yet.', 'err');
-      if (data.rtm_error) showError('RTM: ' + data.rtm_error);
+      setStatus('No data returned — DAM may not be published yet.', 'err');
       btn.disabled = false;
       return;
     }
 
-    renderChart(data.rows);
+    const isSingleDay = start === end;
+    renderChart(data.rows, isSingleDay, start, end);
     renderStats(data.rows);
-    renderTable(data.rows);
+    renderTable(data.rows, isSingleDay);
     document.getElementById('lastUpdated').textContent = 'fetched ' + new Date().toLocaleTimeString();
-
     const rtmCount = data.rows.filter(r => r.rtm !== null).length;
-    const note = rtmCount < data.rows.length ? ` (RTM available for ${rtmCount} hrs)` : '';
-    setStatus('Loaded ' + data.rows.length + ' hours for ' + currentDate + note + '.', 'ok');
+    const rtmNote = rtmCount < data.rows.length ? ` (RTM: ${rtmCount}/${data.rows.length} hrs)` : '';
+    setStatus('Loaded ' + data.rows.length + ' hourly intervals across ' + days + ' day' + (days > 1 ? 's' : '') + rtmNote + '.', 'ok');
     if (data.rtm_error) showError('RTM note: ' + data.rtm_error);
   } catch (e) {
     setStatus('Fetch failed: ' + e.message, 'err');
@@ -511,95 +444,241 @@ async function loadData() {
   btn.disabled = false;
 }
 
+// ── Chart ──────────────────────────────────────────────────────────────────
+
+let lmpChart = null;
+
+function renderChart(rows, isSingleDay, start, end) {
+  document.getElementById('chartSection').style.display = 'block';
+
+  const damData = rows.map(r => r.dam);
+  const rtmData = rows.map(r => r.rtm);
+
+  // For multi-day: label = "May 1" at midnight, blank for other hours
+  // For single-day: label = "HE N"
+  let labels;
+  if (isSingleDay) {
+    labels = rows.map(r => 'HE ' + (r.hour + 1));
+  } else {
+    labels = rows.map(r => r.hour === 0 ? fmtDateShort(r.date) : '');
+  }
+
+  const chartType = isSingleDay ? 'bar' : 'line';
+
+  const damDataset = {
+    label: 'DAM LMP',
+    data: damData,
+    backgroundColor: isSingleDay ? 'rgba(176,120,0,0.75)' : 'rgba(176,120,0,0.15)',
+    borderColor: 'rgba(176,120,0,1)',
+    borderWidth: isSingleDay ? 1 : 1.5,
+    borderRadius: isSingleDay ? 2 : 0,
+    pointRadius: 0,
+    tension: 0.1,
+    fill: false,
+  };
+  const rtmDataset = {
+    label: 'RTM Avg LMP',
+    data: rtmData,
+    backgroundColor: isSingleDay ? 'rgba(42,122,138,0.65)' : 'rgba(42,122,138,0.1)',
+    borderColor: 'rgba(42,122,138,1)',
+    borderWidth: isSingleDay ? 1 : 1.5,
+    borderRadius: isSingleDay ? 2 : 0,
+    pointRadius: 0,
+    tension: 0.1,
+    fill: false,
+    spanGaps: false,
+  };
+
+  const options = {
+    responsive: true,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      legend: {
+        position: 'top', align: 'end',
+        labels: { font: { family: "'IBM Plex Mono'", size: 11 }, boxWidth: 12, padding: 16 },
+      },
+      tooltip: {
+        bodyFont: { family: "'IBM Plex Mono'", size: 11 },
+        titleFont: { family: "'IBM Plex Mono'", size: 11 },
+        callbacks: {
+          title: ctx => {
+            const r = rows[ctx[0].dataIndex];
+            return fmtDateShort(r.date) + '  HE ' + (r.hour + 1);
+          },
+          label: ctx => {
+            const v = ctx.parsed.y;
+            return ' ' + ctx.dataset.label + ': ' + (v !== null ? '$' + v.toFixed(4) : '—');
+          },
+        },
+      },
+    },
+    scales: {
+      x: {
+        grid: { color: 'rgba(232,208,138,0.4)' },
+        ticks: {
+          font: { family: "'IBM Plex Mono'", size: 10 }, color: '#7a6020',
+          maxTicksLimit: isSingleDay ? 24 : 20,
+          autoSkip: !isSingleDay,
+          maxRotation: isSingleDay ? 0 : 45,
+        },
+      },
+      y: {
+        grid: { color: 'rgba(232,208,138,0.4)' },
+        ticks: {
+          font: { family: "'IBM Plex Mono'", size: 10 }, color: '#7a6020',
+          callback: v => '$' + v.toFixed(2),
+        },
+        title: { display: true, text: '$/MWh', font: { family: "'IBM Plex Sans'", size: 11 }, color: '#7a6020' },
+      },
+    },
+  };
+
+  if (lmpChart) {
+    lmpChart.destroy();
+    lmpChart = null;
+  }
+  lmpChart = new Chart(document.getElementById('lmpChart'), {
+    type: chartType,
+    data: { labels, datasets: [damDataset, rtmDataset] },
+    options,
+  });
+}
+
+// ── Stats ──────────────────────────────────────────────────────────────────
+
+function avg(arr) {
+  const v = arr.filter(x => x !== null && x !== undefined);
+  return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+}
 function vc(v) {
   if (v === null || v === undefined) return 'vna';
   return v > 50 ? 'vpos' : v < 0 ? 'vneg' : 'vneu';
 }
-function fmt(v) {
-  if (v === null || v === undefined) return '—';
-  return '$' + v.toFixed(4);
-}
+function fmt(v) { return v === null || v === undefined ? '—' : '$' + v.toFixed(4); }
 function fmtDiff(v) {
   if (v === null || v === undefined) return '—';
-  const sign = v > 0 ? '+' : '';
-  return sign + v.toFixed(4);
+  return (v > 0 ? '+' : '') + v.toFixed(4);
 }
-function fmtHour(h) {
-  const ampm = h < 12 ? 'AM' : 'PM';
-  const h12 = h % 12 === 0 ? 12 : h % 12;
-  return String(h12).padStart(2, '0') + ':00 ' + ampm;
-}
-
-function avg(arr) {
-  const valid = arr.filter(v => v !== null && v !== undefined);
-  return valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : null;
+function fmtDateShort(d) {
+  const dt = new Date(d + 'T12:00:00');
+  return MONTHS[dt.getMonth()] + ' ' + dt.getDate();
 }
 
 function renderStats(rows) {
-  const damVals = rows.map(r => r.dam);
-  const rtmVals = rows.map(r => r.rtm).filter(v => v !== null);
-  const damAvg = avg(damVals);
-  const rtmAvg = rtmVals.length ? avg(rtmVals) : null;
-  const diffAvg = (damAvg !== null && rtmAvg !== null) ? damAvg - rtmAvg : null;
+  const damAvg = avg(rows.map(r => r.dam));
+  const rtmAvg = avg(rows.map(r => r.rtm));
+  const spread = damAvg !== null && rtmAvg !== null ? damAvg - rtmAvg : null;
+  const rtmHrs = rows.filter(r => r.rtm !== null).length;
 
-  const statsRow = document.getElementById('statsRow');
-  statsRow.style.display = 'flex';
-  statsRow.innerHTML =
-    chip('DAM Daily Avg', fmt(damAvg), 'dam-chip') +
-    chip('RTM Daily Avg', rtmAvg !== null ? fmt(rtmAvg) : '—', 'rtm-chip') +
-    chip('Avg Spread (DAM−RTM)', diffAvg !== null ? fmtDiff(diffAvg) : '—', 'diff-chip') +
-    chip('Hours w/ RTM', rtmVals.length + ' / ' + rows.length, '');
+  document.getElementById('statsRow').style.display = 'flex';
+  document.getElementById('statsRow').innerHTML =
+    chip('DAM Avg', fmt(damAvg), 'dam-chip') +
+    chip('RTM Avg', fmt(rtmAvg), 'rtm-chip') +
+    chip('Avg Spread', fmtDiff(spread), 'diff-chip') +
+    chip('RTM Hours', rtmHrs + ' / ' + rows.length, '');
 }
-
 function chip(label, val, cls) {
   return '<div class="stat-chip ' + cls + '"><span class="s-label">' + label + '</span><span class="s-val">' + val + '</span></div>';
 }
 
-function renderTable(rows) {
+// ── Table ──────────────────────────────────────────────────────────────────
+
+function fmtHour(h) {
+  const ap = h < 12 ? 'AM' : 'PM';
+  const h12 = h % 12 === 0 ? 12 : h % 12;
+  return String(h12).padStart(2,'0') + ':00 ' + ap;
+}
+
+function renderTable(rows, isSingleDay) {
   document.getElementById('tableSection').style.display = 'block';
+
+  if (isSingleDay) {
+    renderHourlyTable(rows);
+  } else {
+    renderDailySummaryTable(rows);
+  }
+}
+
+function renderHourlyTable(rows) {
+  document.getElementById('tableDesc').textContent = 'Hourly LMP ($/MWh)';
   document.getElementById('rowCount').textContent = rows.length + ' hours';
 
-  const damVals = rows.map(r => r.dam);
-  const rtmVals = rows.map(r => r.rtm).filter(v => v !== null);
-  const damAvg = avg(damVals);
-  const rtmAvg = rtmVals.length ? avg(rtmVals) : null;
-  const diffAvg = (damAvg !== null && rtmAvg !== null) ? damAvg - rtmAvg : null;
+  const damAvg = avg(rows.map(r => r.dam));
+  const rtmAvg = avg(rows.map(r => r.rtm));
+  const spreadAvg = damAvg !== null && rtmAvg !== null ? damAvg - rtmAvg : null;
 
   let tbody = '';
   rows.forEach(r => {
-    const diff = (r.dam !== null && r.rtm !== null) ? r.dam - r.rtm : null;
-    const endHour = (r.hour + 1) % 24;
-    const endAmPm = endHour < 12 ? 'AM' : 'PM';
-    const endH12 = endHour % 12 === 0 ? 12 : endHour % 12;
-    const timeLabel = fmtHour(r.hour) + ' – ' + String(endH12).padStart(2, '0') + ':00 ' + endAmPm;
+    const diff = r.dam !== null && r.rtm !== null ? r.dam - r.rtm : null;
+    const endH = (r.hour + 1) % 24;
+    const label = fmtHour(r.hour) + ' – ' + String(endH % 12 === 0 ? 12 : endH % 12).padStart(2,'0') + ':00 ' + (endH < 12 ? 'AM' : 'PM');
     tbody += '<tr>'
-      + '<td>' + timeLabel + '</td>'
-      + '<td>HE ' + (r.hour + 1) + '</td>'
+      + '<td>' + label + '</td><td>HE ' + (r.hour + 1) + '</td>'
       + '<td class="' + vc(r.dam) + '">' + fmt(r.dam) + '</td>'
       + '<td class="' + vc(r.rtm) + '">' + fmt(r.rtm) + '</td>'
       + '<td class="' + vc(diff) + '">' + fmtDiff(diff) + '</td>'
       + '</tr>';
   });
-
-  tbody += '<tr class="avg-row">'
-    + '<td colspan="2">Daily Average</td>'
+  tbody += '<tr class="avg-row"><td colspan="2">Daily Average</td>'
     + '<td class="' + vc(damAvg) + '">' + fmt(damAvg) + '</td>'
-    + '<td class="' + vc(rtmAvg) + '">' + (rtmAvg !== null ? fmt(rtmAvg) : '—') + '</td>'
-    + '<td class="' + vc(diffAvg) + '">' + (diffAvg !== null ? fmtDiff(diffAvg) : '—') + '</td>'
-    + '</tr>';
+    + '<td class="' + vc(rtmAvg) + '">' + fmt(rtmAvg) + '</td>'
+    + '<td class="' + vc(spreadAvg) + '">' + fmtDiff(spreadAvg) + '</td></tr>';
 
-  document.getElementById('damTable').innerHTML =
+  document.getElementById('dataTable').innerHTML =
     '<table><thead><tr>'
-    + '<th style="text-align:left">Hour (PT)</th>'
-    + '<th>HE</th>'
-    + '<th class="dam-col">DAM LMP</th>'
-    + '<th class="rtm-col">RTM Avg LMP</th>'
-    + '<th class="diff-col">Spread (DAM−RTM)</th>'
+    + '<th style="text-align:left">Hour (PT)</th><th>HE</th>'
+    + '<th class="dam-col">DAM LMP</th><th class="rtm-col">RTM Avg</th><th>Spread</th>'
     + '</tr></thead><tbody>' + tbody + '</tbody></table>';
 }
 
-initDatePicker();
-loadData();
+function renderDailySummaryTable(rows) {
+  // Group rows by date
+  const byDate = {};
+  rows.forEach(r => {
+    if (!byDate[r.date]) byDate[r.date] = [];
+    byDate[r.date].push(r);
+  });
+  const dates = Object.keys(byDate).sort();
+  document.getElementById('tableDesc').textContent = 'Daily averages ($/MWh)';
+  document.getElementById('rowCount').textContent = dates.length + ' days';
+
+  let tbody = '';
+  const allDam = [], allRtm = [];
+  dates.forEach(d => {
+    const hrs = byDate[d];
+    const damDay = avg(hrs.map(r => r.dam));
+    const rtmDay = avg(hrs.map(r => r.rtm));
+    const spread = damDay !== null && rtmDay !== null ? damDay - rtmDay : null;
+    const dt = new Date(d + 'T12:00:00');
+    const weekday = DAYS[dt.getDay()];
+    allDam.push(damDay);
+    if (rtmDay !== null) allRtm.push(rtmDay);
+    tbody += '<tr>'
+      + '<td>' + d + '</td><td>' + weekday + '</td>'
+      + '<td class="' + vc(damDay) + '">' + fmt(damDay) + '</td>'
+      + '<td class="' + vc(rtmDay) + '">' + fmt(rtmDay) + '</td>'
+      + '<td class="' + vc(spread) + '">' + fmtDiff(spread) + '</td>'
+      + '<td>' + hrs.length + '</td>'
+      + '</tr>';
+  });
+
+  const totalDam = avg(allDam);
+  const totalRtm = allRtm.length ? avg(allRtm) : null;
+  const totalSpread = totalDam !== null && totalRtm !== null ? totalDam - totalRtm : null;
+  tbody += '<tr class="avg-row"><td colspan="2">Period Average</td>'
+    + '<td class="' + vc(totalDam) + '">' + fmt(totalDam) + '</td>'
+    + '<td class="' + vc(totalRtm) + '">' + fmt(totalRtm) + '</td>'
+    + '<td class="' + vc(totalSpread) + '">' + fmtDiff(totalSpread) + '</td>'
+    + '<td>' + rows.length + '</td></tr>';
+
+  document.getElementById('dataTable').innerHTML =
+    '<table><thead><tr>'
+    + '<th style="text-align:left">Date</th><th style="text-align:left">Day</th>'
+    + '<th class="dam-col">DAM Avg</th><th class="rtm-col">RTM Avg</th><th>Spread</th><th>Hrs</th>'
+    + '</tr></thead><tbody>' + tbody + '</tbody></table>';
+}
+
+init();
 </script>
 </body>
 </html>"""
@@ -612,21 +691,29 @@ def index():
 
 @app.route("/data")
 def data():
-    date_str = request.args.get("date")
-    if not date_str:
-        return jsonify({"error": "date parameter required"})
+    start_date = request.args.get("start_date") or request.args.get("date")
+    end_date = request.args.get("end_date") or start_date
+
+    if not start_date:
+        return jsonify({"error": "start_date parameter required"})
     try:
-        datetime.strptime(date_str, "%Y-%m-%d")
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
     except ValueError:
         return jsonify({"error": "Invalid date format, use YYYY-MM-DD"})
+    if end_dt < start_dt:
+        return jsonify({"error": "end_date must be on or after start_date"})
+    if (end_dt - start_dt).days > MAX_RANGE_DAYS:
+        return jsonify({"error": f"Date range cannot exceed {MAX_RANGE_DAYS} days"})
 
-    print(f"[REQUEST] Fetching DAM + RTM for {date_str}", flush=True)
+    days = (end_dt - start_dt).days + 1
+    print(f"[REQUEST] {start_date} → {end_date} ({days} days)", flush=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        dam_future = executor.submit(fetch_dam_day, date_str)
-        rtm_future = executor.submit(fetch_rtm_day, date_str)
-        dam_raw, dam_err = dam_future.result()
-        rtm_raw, rtm_err = rtm_future.result()
+        dam_f = executor.submit(fetch_dam_range, start_date, end_date)
+        rtm_f = executor.submit(fetch_rtm_range, start_date, end_date)
+        dam_raw, dam_err = dam_f.result()
+        rtm_raw, rtm_err = rtm_f.result()
 
     if dam_err:
         return jsonify({"error": dam_err, "rows": []})
@@ -637,15 +724,12 @@ def data():
     if not dam_rows:
         return jsonify({"error": "No DAM data returned", "rows": [], "rtm_error": rtm_err})
 
-    rtm_by_hour = {r["hour"]: r["lmp"] for r in rtm_rows}
-    combined = []
-    for r in dam_rows:
-        combined.append({
-            "date": r["date"],
-            "hour": r["hour"],
-            "dam": r["lmp"],
-            "rtm": rtm_by_hour.get(r["hour"], None),
-        })
+    rtm_by_key = {(r["date"], r["hour"]): r["lmp"] for r in rtm_rows}
+    combined = [
+        {"date": r["date"], "hour": r["hour"], "dam": r["lmp"],
+         "rtm": rtm_by_key.get((r["date"], r["hour"]), None)}
+        for r in dam_rows
+    ]
 
     return jsonify({"rows": combined, "rtm_error": rtm_err})
 
