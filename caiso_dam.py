@@ -348,6 +348,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div class="table-wrap"><div id="dataTable"></div></div>
   </div>
 
+  <div id="hourlyTableSection" style="display:none; margin-top:16px">
+    <div class="section-header">
+      <span class="market-label">Hourly</span>
+      <span class="section-desc">All hours for selected range</span>
+      <span class="section-count" id="hourlyRowCount"></span>
+    </div>
+    <div class="table-wrap"><div id="hourlyTable"></div></div>
+  </div>
+
 </div>
 
 <script>
@@ -407,6 +416,7 @@ async function loadData() {
   document.getElementById('chartSection').style.display = 'none';
   document.getElementById('statsRow').style.display = 'none';
   document.getElementById('tableSection').style.display = 'none';
+  document.getElementById('hourlyTableSection').style.display = 'none';
   showError(null);
 
   const waitMsg = days > 7 ? ` — fetching ${days} days, please wait…` : '';
@@ -675,6 +685,42 @@ function renderDailySummaryTable(rows) {
     '<table><thead><tr>'
     + '<th style="text-align:left">Date</th><th style="text-align:left">Day</th>'
     + '<th class="dam-col">DAM Avg</th><th class="rtm-col">RTM Avg</th><th>Spread</th><th>Hrs</th>'
+    + '</tr></thead><tbody>' + tbody + '</tbody></table>';
+
+  renderAllHoursTable(rows);
+}
+
+function renderAllHoursTable(rows) {
+  document.getElementById('hourlyTableSection').style.display = 'block';
+  document.getElementById('hourlyRowCount').textContent = rows.length + ' hours';
+
+  let tbody = '';
+  rows.forEach(r => {
+    const diff = r.dam !== null && r.rtm !== null ? r.dam - r.rtm : null;
+    const dt = new Date(r.date + 'T12:00:00');
+    const weekday = DAYS[dt.getDay()];
+    const endH = (r.hour + 1) % 24;
+    const timeLabel = fmtHour(r.hour) + ' – ' + String(endH % 12 === 0 ? 12 : endH % 12).padStart(2,'0') + ':00 ' + (endH < 12 ? 'AM' : 'PM');
+    tbody += '<tr>'
+      + '<td>' + r.date + '</td>'
+      + '<td style="text-align:left;color:var(--muted)">' + weekday + '</td>'
+      + '<td>HE ' + (r.hour + 1) + '</td>'
+      + '<td style="text-align:left;color:var(--muted);white-space:nowrap">' + timeLabel + '</td>'
+      + '<td class="' + vc(r.dam) + '">' + fmt(r.dam) + '</td>'
+      + '<td class="' + vc(r.rtm) + '">' + fmt(r.rtm) + '</td>'
+      + '<td class="' + vc(diff) + '">' + fmtDiff(diff) + '</td>'
+      + '</tr>';
+  });
+
+  document.getElementById('hourlyTable').innerHTML =
+    '<table><thead><tr>'
+    + '<th style="text-align:left">Date</th>'
+    + '<th style="text-align:left">Day</th>'
+    + '<th>HE</th>'
+    + '<th style="text-align:left">Hour (PT)</th>'
+    + '<th class="dam-col">DAM LMP</th>'
+    + '<th class="rtm-col">RTM Avg</th>'
+    + '<th>Spread</th>'
     + '</tr></thead><tbody>' + tbody + '</tbody></table>';
 }
 
